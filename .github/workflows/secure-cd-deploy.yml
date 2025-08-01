@@ -258,9 +258,13 @@ jobs:
           MONGODB_USER=$(az keyvault secret show --vault-name kv-wizapp-nonprod-001 --name mongodb-user --query value -o tsv)
           MONGODB_PASSWORD=$(az keyvault secret show --vault-name kv-wizapp-nonprod-001 --name mongodb-password --query value -o tsv)
           
+          # URL encode the password to handle special characters
+          ENCODED_PASSWORD=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$MONGODB_PASSWORD'))")
+          ENCODED_USER=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$MONGODB_USER'))")
+          
           # Export variables for template substitution
           export IMAGE_REFERENCE="${{ needs.validate_artifacts.outputs.full_reference }}"
-          export MONGODB_URI="mongodb://$MONGODB_USER:$MONGODB_PASSWORD@10.100.0.4:27017/go-mongodb?authSource=admin"
+          export MONGODB_URI="mongodb://$ENCODED_USER:$ENCODED_PASSWORD@10.100.0.4:27017/go-mongodb?authSource=admin"
           
           # Process template locally first
           envsubst < k8s-manifests.yaml > processed-manifests.yaml
