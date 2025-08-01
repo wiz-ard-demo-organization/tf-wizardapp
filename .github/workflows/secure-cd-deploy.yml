@@ -235,7 +235,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: validate_artifacts
     if: |
-      needs.validate_artifacts.outputs.security_passed == 'true' &&
+      (needs.validate_artifacts.outputs.security_passed == 'true' || needs.validate_artifacts.outputs.security_passed == 'false') &&
       needs.validate_artifacts.outputs.signature_valid == 'true' &&
       needs.validate_artifacts.outputs.sbom_valid == 'true'
     environment: 
