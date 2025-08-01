@@ -10,6 +10,7 @@ on:
       repository:
         required: true
         type: string
+        default: 'wiz-ard-demo-organization/tf-wizardapp'
         description: 'Repository where the CI pipeline ran (e.g., owner/repo-name)'
       environment:
         description: 'Environment to deploy to'
