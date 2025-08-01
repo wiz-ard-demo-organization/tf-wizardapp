@@ -241,7 +241,6 @@ jobs:
       needs.validate_artifacts.outputs.sbom_valid == 'true'
     environment: 
       name: ${{ github.event.inputs.environment }}
-      url: http://20.62.146.240
 
     steps:
       - name: Checkout code
