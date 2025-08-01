@@ -312,20 +312,38 @@ jobs:
 
       - name: Validate wizexercise.txt in Running Pod
         run: |
-          POD_NAME=$(kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}')
+          POD_NAME=$(az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}'" \
+            --output tsv)
+          
           echo "### wizexercise.txt Validation" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Pod:** $POD_NAME" >> $GITHUB_STEP_SUMMARY
           echo "**File Contents:**" >> $GITHUB_STEP_SUMMARY
-          kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt >> $GITHUB_STEP_SUMMARY
+          
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt" >> $GITHUB_STEP_SUMMARY
 
       - name: Application Health Check
         run: |
           sleep 30
           
-          SERVICE_IP=$(kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          SERVICE_IP=$(az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}'" \
+            --output tsv)
+          
           if [ -z "$SERVICE_IP" ]; then
-            SERVICE_IP=$(kubectl get svc wizapp-service -n wizapp -o jsonpath='{.spec.clusterIP}')
+            SERVICE_IP=$(az aks command invoke \
+              --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+              --name aks-wizapp-nonprod-eastus2-001 \
+              --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.spec.clusterIP}'" \
+              --output tsv)
           fi
           
           echo "### Application Health Check" >> $GITHUB_STEP_SUMMARY
