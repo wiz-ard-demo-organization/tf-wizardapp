@@ -312,21 +312,24 @@ jobs:
 
       - name: Validate wizexercise.txt in Running Pod
         run: |
-          POD_NAME=$(az aks command invoke \
-            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
-            --name aks-wizapp-nonprod-eastus2-001 \
-            --command "kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}'" \
-            --output tsv)
-          
           echo "### wizexercise.txt Validation" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Pod:** $POD_NAME" >> $GITHUB_STEP_SUMMARY
-          echo "**File Contents:**" >> $GITHUB_STEP_SUMMARY
           
+          # List pods first for debugging
+          echo "**Available Pods:**" >> $GITHUB_STEP_SUMMARY
           az aks command invoke \
             --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
             --name aks-wizapp-nonprod-eastus2-001 \
-            --command "kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+            --command "kubectl get pods -n wizapp -l app=wizapp" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**File Contents:**" >> $GITHUB_STEP_SUMMARY
+          
+          # Execute directly without storing pod name
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get pods -n wizapp -l app=wizapp -o name | head -1 | xargs -I {} kubectl exec {} -- cat /app/wizexercise.txt" >> $GITHUB_STEP_SUMMARY
 
       - name: Application Health Check
         run: |
