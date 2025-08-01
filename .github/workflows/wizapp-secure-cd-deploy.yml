@@ -15,10 +15,10 @@ on:
       environment:
         description: 'Environment to deploy to'
         required: true
-        default: 'nonprod'
+        default: 'wizard'
         type: choice
         options:
-        - nonprod
+        - wizard
 
 
 permissions:

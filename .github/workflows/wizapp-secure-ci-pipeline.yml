@@ -19,7 +19,7 @@ env:
 jobs:
   build_and_scan:
     runs-on: ubuntu-latest
-    environment: nonprod
+    environment: wizard
     env:
       REMOTE_IMAGE_NAME: acrwizappnonprod001.azurecr.io/nonprod/wizapp:${{ github.sha }}
     outputs:
