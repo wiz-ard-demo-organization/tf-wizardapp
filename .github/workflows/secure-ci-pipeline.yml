@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: nonprod
     env:
-      REMOTE_IMAGE_NAME: ${{ vars.AZURE_SUBSCRIPTION_ID }}.azurecr.io/nonprod/wizapp:${{ github.sha }}
+      REMOTE_IMAGE_NAME: acrwizappnonprod001.azurecr.io/nonprod/wizapp:${{ github.sha }}
     outputs:
       image_digest: ${{ steps.get_digest.outputs.digest }}
       scan_passed: ${{ steps.scan_analysis.outputs.scan_passed }}
