@@ -1,0 +1,363 @@
+name: Secure CI Pipeline - Build & Security Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY_NAME: acrwizappnonprod001
+  IMAGE_NAME: wizapp
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+
+jobs:
+  build_and_scan:
+    runs-on: ubuntu-latest
+    environment: nonprod
+    env:
+      REMOTE_IMAGE_NAME: acrwizappnonprod001.azurecr.io/nonprod/wizapp:${{ github.sha }}
+    outputs:
+      image_digest: ${{ steps.get_digest.outputs.digest }}
+      scan_passed: ${{ steps.scan_analysis.outputs.scan_passed }}
+      total_critical: ${{ steps.scan_analysis.outputs.total_critical }}
+      total_high: ${{ steps.scan_analysis.outputs.total_high }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy config scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          hide-progress: false
+          format: 'json'
+          output: 'trivy-config-results.json'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          hide-progress: false
+          format: 'json'
+          output: 'trivy-vulnerability-results.json'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+
+      - name: Run Trivy secret scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'secret'
+          hide-progress: false
+          format: 'json'
+          output: 'trivy-secret-results.json'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Display secret scan results
+        if: always()
+        run: |
+          if [ -f trivy-secret-results.json ]; then
+            echo "Secret Scan Results:"
+            cat trivy-secret-results.json | jq '.' || cat trivy-secret-results.json
+          else
+            echo  "No secret scan results file found"
+          fi
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.REMOTE_IMAGE_NAME }} .
+
+      - name: Security Scan - Pre-push image vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REMOTE_IMAGE_NAME }}'
+          format: 'json'
+          output: 'trivy-image-scan-results.json'
+          exit-code: '0'
+          ignore-unfixed: false
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+
+      - name: Analyze scan results
+        id: scan_analysis
+        run: |
+          TOTAL_CRITICAL=0
+          TOTAL_HIGH=0
+          SCAN_PASSED=true
+          FAILED_SCANS=""
+
+          check_scan_results() {
+            local file=$1
+            local scan_name=$2
+
+            if [ -f "$file" ]; then
+                if [[ "$file" == *.sarif ]]; then
+                    COUNT=$(jq '.runs[0].results | length' "$file" 2>/dev/null || echo "0")
+                    
+                    if [ "$COUNT" -gt 0 ]; then
+                        echo "$scan_name: Found $COUNT secrets"
+                        SCAN_PASSED=false
+                        FAILED_SCANS="${FAILED_SCANS}${scan_name}: $COUNT secrets found; "
+                    else
+                        echo "$scan_name: PASSED (no secrets found)"
+                    fi
+                else
+                    CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$file" 2>/dev/null || echo "0")
+                    HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$file" 2>/dev/null || echo "0")
+
+                    TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
+                    TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+
+                    if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+                        echo "$scan_name: Found $CRITICAL CRITICAL, $HIGH HIGH vulnerabilities"
+                        SCAN_PASSED=false
+                        FAILED_SCANS="${FAILED_SCANS}${scan_name}: ${CRITICAL}C/${HIGH}H; "
+                    else
+                        echo "$scan_name: PASSED (no critical/high vulnerabilities)"
+                    fi
+                fi
+            fi
+          }
+
+          echo "=== Security Scan Analysis ==="
+          check_scan_results "trivy-config-results.json" "Config Scan"
+          check_scan_results "trivy-vulnerability-results.json" "Vulnerability Scan"
+          check_scan_results "trivy-secret-results.sarif" "Secret Scan"
+          check_scan_results "trivy-image-scan-results.json" "Image Scan"
+
+          echo ""
+          echo "=== Summary ==="
+          echo "Total CRITICAL vulnerabilities: $TOTAL_CRITICAL"
+          echo "Total HIGH vulnerabilities: $TOTAL_HIGH"
+          echo "Overall Status: $([ "$SCAN_PASSED" = true ] && echo "PASSED" || echo "FAILED")"
+
+          echo "scan_passed=$SCAN_PASSED" >> $GITHUB_OUTPUT
+          echo "total_critical=$TOTAL_CRITICAL" >> $GITHUB_OUTPUT
+          echo "total_high=$TOTAL_HIGH" >> $GITHUB_OUTPUT
+          echo "failed_scans=$FAILED_SCANS" >> $GITHUB_OUTPUT
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.15.1
+
+      - name: Generate SBOM
+        run: |
+          syft packages docker:${{ env.REMOTE_IMAGE_NAME }} -o spdx-json > sbom.json
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ env.REGISTRY_NAME }}
+
+      - name: Push Docker image
+        run: docker push ${{ env.REMOTE_IMAGE_NAME }}
+
+      - name: Get image digest
+        id: get_digest
+        run: |
+          DIGEST=$(az acr repository show \
+            --name ${{ env.REGISTRY_NAME }} \
+            --image nonprod/wizapp:${{ github.sha }} \
+            --query digest -o tsv)
+          echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_ENV
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Image digest: $DIGEST"
+
+      - name: Save image metadata
+        run: |
+          echo "${{ env.IMAGE_DIGEST }}" > image-digest.txt
+          echo "${{ env.REMOTE_IMAGE_NAME }}" > image-tag.txt
+          echo "${{ env.REGISTRY_NAME }}.azurecr.io/nonprod/wizapp@${{ env.IMAGE_DIGEST }}" > image-full-reference.txt
+          echo "${{ github.sha }}" > commit-sha.txt
+          echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > build-timestamp.txt
+          echo "${{ github.ref_name }}" > branch-name.txt
+
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION_TAG=${GITHUB_REF#refs/tags/}
+            echo "$VERSION_TAG" > version-tag.txt
+            SOURCE_BRANCH=$(git branch -r --contains ${{ github.sha }} | grep -E "(origin/main|origin/master)" | head -1 | sed 's/.*origin\///' | xargs)
+            if [ -z "$SOURCE_BRANCH" ]; then
+              SOURCE_BRANCH=$(git branch -r --contains ${{ github.sha }} | head -1 | sed 's/.*origin\///' | xargs)
+            fi
+            echo "$SOURCE_BRANCH" > source-branch.txt
+          else
+            echo "none" > version-tag.txt
+            echo "${{ github.ref_name }}" > source-branch.txt
+          fi
+
+          cat > image-metadata.json << EOF
+          {
+            "digest": "${{ env.IMAGE_DIGEST }}",
+            "tag": "${{ env.REMOTE_IMAGE_NAME }}",
+            "full_reference": "${{ env.REGISTRY_NAME }}.azurecr.io/nonprod/wizapp@${{ env.IMAGE_DIGEST }}",
+            "commit_sha": "${{ github.sha }}",
+            "build_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "source_branch": "$(cat source-branch.txt)",
+            "repository": "${{ github.repository }}",
+            "registry": "${{ env.REGISTRY_NAME }}.azurecr.io",
+            "image_name": "nonprod/wizapp",
+            "version_tag": "$(cat version-tag.txt)"
+          }
+          EOF
+
+          echo "Created image metadata files:"
+          ls -la *.txt *.json
+
+      - name: Upload image metadata as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-metadata-${{ github.run_number }}
+          path: |
+            image-digest.txt
+            image-tag.txt
+            image-full-reference.txt
+            commit-sha.txt
+            build-timestamp.txt
+            branch-name.txt
+            source-branch.txt
+            version-tag.txt
+            image-metadata.json
+          retention-days: 30
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.2
+        with:
+          cosign-release: main
+
+      - name: Sign container image
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign sign --yes --rekor-url https://rekor.sigstore.dev ${{ env.REGISTRY_NAME }}.azurecr.io/nonprod/wizapp@${{ env.IMAGE_DIGEST }}
+
+      - name: Attach SBOM attestation
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign attest --yes --rekor-url https://rekor.sigstore.dev --type spdx --predicate sbom.json ${{ env.REGISTRY_NAME }}.azurecr.io/nonprod/wizapp@${{ env.IMAGE_DIGEST }}
+
+      - name: Verify signature
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign verify ${{ env.REGISTRY_NAME }}.azurecr.io/nonprod/wizapp@${{ env.IMAGE_DIGEST }} \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+      - name: Verify SBOM attestation
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          echo "Verifying SBOM attestation..."
+          if cosign verify-attestation ${{ env.REGISTRY_NAME }}.azurecr.io/nonprod/wizapp@${{ env.IMAGE_DIGEST }} \
+            --type spdx \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com 2>&1 | \
+            tee attestation-output.log && \
+            grep -q "The cosign claims were validated" attestation-output.log; then
+            echo "SBOM verification passed"
+          else
+            echo "SBOM attestation verification FAILED!"
+            exit 1
+          fi
+
+      - name: Create comprehensive scan analysis report
+        run: |
+          cat > scan-analysis.json << EOF
+          {
+            "analysis_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "overall_status": "${{ steps.scan_analysis.outputs.scan_passed == 'true' && 'PASSED' || 'FAILED' }}",
+            "summary": {
+              "total_critical_vulnerabilities": ${{ steps.scan_analysis.outputs.total_critical || '0' }},
+              "total_high_vulnerabilities": ${{ steps.scan_analysis.outputs.total_high || '0' }},
+              "scan_passed": ${{ steps.scan_analysis.outputs.scan_passed == 'true' && 'true' || 'false' }},
+              "failed_scans": "${{ steps.scan_analysis.outputs.failed_scans }}"
+            },
+            "image_details": {
+              "image_name": "${{ env.REMOTE_IMAGE_NAME }}",
+              "image_digest": "${{ env.IMAGE_DIGEST }}",
+              "registry": "${{ env.REGISTRY_NAME }}.azurecr.io"
+            },
+            "individual_scans": {
+              "config_scan": {
+                "file": "trivy-config-results.json",
+                "critical": $(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-config-results.json 2>/dev/null || echo "0"),
+                "high": $(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-config-results.json 2>/dev/null || echo "0")
+              },
+              "vulnerability_scan": {
+                "file": "trivy-vulnerability-results.json",
+                "critical": $(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-vulnerability-results.json 2>/dev/null || echo "0"),
+                "high": $(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-vulnerability-results.json 2>/dev/null || echo "0")
+              },
+              "secret_scan": {
+                "file": "trivy-secret-results.sarif",
+                "secrets_found": $(jq '.runs[0].results | length' trivy-secret-results.sarif 2>/dev/null || echo "0")
+              },
+              "image_scan": {
+                "file": "trivy-image-scan-results.json",
+                "critical": $(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-image-scan-results.json 2>/dev/null || echo "0"),
+                "high": $(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-image-scan-results.json 2>/dev/null || echo "0")
+              }
+            },
+            "signatures": {
+              "signed": true,
+              "signature_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            },
+            "build_info": {
+              "workflow_run_id": "${{ github.run_id }}",
+              "workflow_run_number": "${{ github.run_number }}",
+              "commit_sha": "${{ github.sha }}",
+              "branch": "${{ github.ref_name }}",
+              "repository": "${{ github.repository }}"
+            }
+          }
+          EOF
+
+      - name: Upload consolidated security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts-${{ github.run_number }}
+          path: |
+            scan-analysis.json
+            trivy-config-results.json
+            trivy-vulnerability-results.json
+            trivy-secret-results.sarif
+            trivy-image-scan-results.json
+          retention-days: 30
+
+      - name: Clean sensitive files
+        run: |
+          rm -f sbom.json
+          rm -f trivy-*.json
+          rm -f trivy-secret-results.sarif
+          rm -f scan-analysis.json
+          rm -f *.txt
+        if: always()
+
+      - name: Final workspace cleanup
+        run: |
+          rm -rf $GITHUB_WORKSPACE/*
+        if: always() 

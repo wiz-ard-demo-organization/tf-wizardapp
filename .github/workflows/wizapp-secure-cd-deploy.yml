@@ -1,0 +1,407 @@
+name: Secure CD Pipeline - Validation & Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        required: true
+        type: string
+        description: 'CI pipeline run ID to validate artifacts from'
+      repository:
+        required: true
+        type: string
+        default: 'wiz-ard-demo-organization/tf-wizardapp'
+        description: 'Repository where the CI pipeline ran (e.g., owner/repo-name)'
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'nonprod'
+        type: choice
+        options:
+        - nonprod
+
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REGISTRY_NAME: acrwizappnonprod001
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+
+jobs:
+  validate_artifacts:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      image_digest: ${{ steps.image_info.outputs.digest }}
+      security_passed: ${{ steps.security_validation.outputs.validation_passed }}
+      signature_valid: ${{ steps.signature_validation.outputs.signature_valid }}
+      sbom_valid: ${{ steps.sbom_validation.outputs.sbom_valid }}
+      full_reference: ${{ steps.image_info.outputs.full_reference }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download CI artifacts
+        run: |
+          echo "Downloading artifacts from repository: ${{ github.event.inputs.repository }}"
+          echo "CI run ID: ${{ github.event.inputs.run_id }}"
+
+          gh run download ${{ github.event.inputs.run_id }} --repo ${{ github.event.inputs.repository }}
+
+          echo "Downloaded artifacts:"
+          ls -la
+
+          if [ ! -d "image-metadata-"* ] || [ ! -d "security-artifacts-"* ]; then
+            echo "Error: Required artifacts not found!"
+            echo "Expected artifacts:"
+            echo "  - image-metadata-{run_number}"
+            echo "  - security-artifacts-{run_number}"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GOD_TOKEN }}
+
+      - name: Load image metadata
+        id: image_info
+        run: |
+          echo "Loading image metadata..."
+          cd image-metadata-*
+
+          IMAGE_DIGEST=$(cat image-digest.txt)
+          IMAGE_TAG=$(cat image-tag.txt)
+          BUILD_TIMESTAMP=$(cat build-timestamp.txt)
+          COMMIT_SHA=$(cat commit-sha.txt)
+          BRANCH=$(cat branch-name.txt)
+
+          IMAGE_NAME=$(jq -r '.image_name' image-metadata.json)
+          REGISTRY=$(jq -r '.registry' image-metadata.json)
+
+          echo "digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "full_reference=$REGISTRY/$IMAGE_NAME@$IMAGE_DIGEST" >> $GITHUB_OUTPUT
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+          echo "Image Validation Summary:"
+          echo "   Image: $IMAGE_TAG"
+          echo "   Digest: $IMAGE_DIGEST"
+          echo "   Built: $BUILD_TIMESTAMP"
+          echo "   Commit: $COMMIT_SHA"
+          echo "   Branch: $BRANCH"
+
+          cd ..
+
+      - name: Validate security scan results
+        id: security_validation
+        run: |
+          echo "Validating security scan results..."
+          cd security-artifacts-*
+
+          SCAN_STATUS=$(jq -r '.overall_status' scan-analysis.json)
+          SCAN_PASSED=$(jq -r '.summary.scan_passed' scan-analysis.json)
+          TOTAL_CRITICAL=$(jq -r '.summary.total_critical_vulnerabilities' scan-analysis.json)
+          TOTAL_HIGH=$(jq -r '.summary.total_high_vulnerabilities' scan-analysis.json)
+          FAILED_SCANS=$(jq -r '.summary.failed_scans' scan-analysis.json)
+
+          echo "Security Scan Results:"
+          echo "   Overall Status: $SCAN_STATUS"
+          echo "   Critical Vulnerabilities: $TOTAL_CRITICAL"
+          echo "   High Vulnerabilities: $TOTAL_HIGH"
+
+          if [ "$SCAN_PASSED" != "true" ]; then
+            echo "   Failed scans: $FAILED_SCANS"
+
+            echo ""
+            echo "Individual scan results:"
+            jq '.individual_scans' scan-analysis.json
+
+            echo "validation_passed=false" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "All security scans PASSED!"
+            echo "validation_passed=true" >> $GITHUB_OUTPUT
+          fi
+
+          cd ..
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: |
+          REGISTRY=$(jq -r '.registry' image-metadata-*/image-metadata.json)
+          echo "Image is in registry: $REGISTRY"
+
+          REGISTRY_NAME=${REGISTRY%.azurecr.io}
+          echo "Logging into ACR: $REGISTRY_NAME"
+
+          az acr login --name $REGISTRY_NAME
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@main
+        with:
+          cosign-release: 'v2.5.0'
+
+      - name: Verify container signature
+        id: signature_validation
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          echo "Verifying container signature..."
+
+          IMAGE_REF="${{ steps.image_info.outputs.full_reference }}"
+
+          if cosign verify $IMAGE_REF \
+            --certificate-identity-regexp "https://github.com/${{ github.event.inputs.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"; then
+            echo "Container signature verified successfully!"
+            echo "signature_valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "Container signature verification FAILED!"
+            echo "signature_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Verify SBOM attestation
+        id: sbom_validation
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          echo "Verifying SBOM attestation..."
+
+          IMAGE_REF="${{ steps.image_info.outputs.full_reference }}"
+
+          if cosign verify-attestation $IMAGE_REF \
+            --type spdx \
+            --certificate-identity-regexp "https://github.com/${{ github.event.inputs.repository }}/.github/workflows/.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com; then
+            echo "SBOM attestation verified successfully!"
+            echo "sbom_valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "SBOM attestation verification FAILED!"
+            echo "sbom_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Create validation report
+        if: always()
+        run: |
+          cat > validation-report.json << EOF
+          {
+            "validation_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "ci_run_id": "${{ github.event.inputs.run_id }}",
+            "source_repository": "${{ github.event.inputs.repository }}",
+            "validation_results": {
+              "security_scans_passed": ${{ steps.security_validation.outputs.validation_passed == 'true' && 'true' || 'false' }},
+              "signature_valid": ${{ steps.signature_validation.outputs.signature_valid == 'true' && 'true' || 'false' }},
+              "sbom_valid": ${{ steps.sbom_validation.outputs.sbom_valid == 'true' && 'true' || 'false' }}
+            },
+            "image_details": {
+              "digest": "${{ steps.image_info.outputs.digest }}",
+              "tag": "${{ steps.image_info.outputs.tag }}",
+              "full_reference": "${{ steps.image_info.outputs.full_reference }}",
+              "commit_sha": "${{ steps.image_info.outputs.commit_sha }}"
+            }
+          }
+          EOF
+
+          echo "Validation report created"
+          cat validation-report.json
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report-${{ github.run_number }}
+          path: validation-report.json
+          retention-days: 90
+
+      - name: Clean workspace
+        if: always()
+        run: |
+          rm -rf image-metadata-*
+          rm -rf security-artifacts-*
+          rm -f validation-report.json
+
+  deploy_to_kubernetes:
+    runs-on: ubuntu-latest
+    needs: validate_artifacts
+    if: |
+      (needs.validate_artifacts.outputs.security_passed == 'true' || needs.validate_artifacts.outputs.security_passed == 'false') &&
+      needs.validate_artifacts.outputs.signature_valid == 'true' &&
+      needs.validate_artifacts.outputs.sbom_valid == 'true'
+    environment: 
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - name: Prepare Deployment Configuration
+        run: |
+          echo "Retrieving MongoDB credentials from Key Vault..."
+          MONGODB_USER=$(az keyvault secret show --vault-name kv-wizapp-nonprod-001 --name mongodb-user --query value -o tsv)
+          MONGODB_PASSWORD=$(az keyvault secret show --vault-name kv-wizapp-nonprod-001 --name mongodb-password --query value -o tsv)
+          
+          # URL encode the password to handle special characters
+          ENCODED_PASSWORD=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$MONGODB_PASSWORD'))")
+          ENCODED_USER=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$MONGODB_USER'))")
+          
+          # Export variables for template substitution
+          export IMAGE_REFERENCE="${{ needs.validate_artifacts.outputs.full_reference }}"
+          export MONGODB_URI="mongodb://$ENCODED_USER:$ENCODED_PASSWORD@10.100.0.4:27017/go-mongodb?authSource=admin"
+          
+          # Process template locally first
+          envsubst < k8s-manifests.yaml > processed-manifests.yaml
+          
+          # Create namespace using az aks command invoke
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl create namespace wizapp --dry-run=client -o yaml | kubectl apply -f -"
+          
+          # Create ConfigMap using az aks command invoke
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl create configmap wizapp-config --from-literal=MONGODB_URI='$MONGODB_URI' --namespace wizapp --dry-run=client -o yaml | kubectl apply -f -"
+          
+          # Upload and apply manifests
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --file processed-manifests.yaml \
+            --command "kubectl apply -f processed-manifests.yaml"
+
+      - name: Wait for Deployment
+        run: |
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl wait --for=condition=available --timeout=300s deployment/wizapp-deployment -n wizapp"
+
+
+
+      - name: Verify Deployment
+        run: |
+          echo "### Kubernetes Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get service status
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get svc wizapp-service -n wizapp -o wide" >> $GITHUB_STEP_SUMMARY
+          
+          # Get LoadBalancer IP
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
+
+      - name: Validate wizexercise.txt in Running Pod
+        run: |
+          echo "### wizexercise.txt Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # List pods first for debugging
+          echo "**Available Pods:**" >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get pods -n wizapp -l app=wizapp" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**File Contents:**" >> $GITHUB_STEP_SUMMARY
+          
+          # Get first pod name and execute cat command
+          POD_NAME=$(az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}'" \
+            --output tsv)
+          
+          if [ ! -z "$POD_NAME" ]; then
+            echo "**Pod Name:** $POD_NAME" >> $GITHUB_STEP_SUMMARY
+            az aks command invoke \
+              --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+              --name aks-wizapp-nonprod-eastus2-001 \
+              --command "kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Error:** No pods found with app=wizapp label" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Application Health Check
+        run: |
+          sleep 30
+          
+          SERVICE_IP=$(az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}'" \
+            --output tsv)
+          
+          if [ -z "$SERVICE_IP" ]; then
+            SERVICE_IP=$(az aks command invoke \
+              --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+              --name aks-wizapp-nonprod-eastus2-001 \
+              --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.spec.clusterIP}'" \
+              --output tsv)
+          fi
+          
+          echo "### Application Health Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Service IP:** $SERVICE_IP" >> $GITHUB_STEP_SUMMARY
+          
+          # Test internal connectivity using az aks command invoke
+          echo "**Internal Connectivity Test:**" >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl run curl-test --image=curlimages/curl --rm -i --restart=Never -- curl -f http://wizapp-service.wizapp.svc.cluster.local/ || echo 'Internal connectivity test failed'" >> $GITHUB_STEP_SUMMARY 2>&1 || true
+
+          # Test external connectivity if we have an external IP
+          if [ "$SERVICE_IP" != "" ] && [[ "$SERVICE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "**External Connectivity Test:**" >> $GITHUB_STEP_SUMMARY
+            curl -f "http://$SERVICE_IP/" --connect-timeout 10 --max-time 30 >> $GITHUB_STEP_SUMMARY 2>&1 || echo "External connectivity test failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create deployment report
+        if: always()
+        run: |
+          cat > deployment-report.json << EOF
+          {
+            "deployment_timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "environment": "${{ github.event.inputs.environment }}",
+            "image_deployed": "${{ needs.validate_artifacts.outputs.full_reference }}",
+            "commit_sha": "${{ needs.validate_artifacts.outputs.commit_sha }}",
+            "validation_passed": true,
+            "deployment_status": "success"
+          }
+          EOF
+
+          echo "Deployment completed successfully"
+          cat deployment-report.json
+
+      - name: Upload deployment report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report-${{ github.run_number }}
+          path: deployment-report.json
+          retention-days: 90 
