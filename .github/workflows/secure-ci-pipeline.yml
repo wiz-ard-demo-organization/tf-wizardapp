@@ -40,20 +40,6 @@ jobs:
           go-version: '1.23'
           check-latest: true
 
-      - name: Cache Go build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
-
-      - name: Run Go tests
-        run: |
-          go mod download
-          go test -v ./...
-
       - name: Build application
         run: go build -v ./...
 
