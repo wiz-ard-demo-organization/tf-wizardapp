@@ -329,11 +329,22 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**File Contents:**" >> $GITHUB_STEP_SUMMARY
           
-          # Execute directly without storing pod name
-          az aks command invoke \
+          # Get first pod name and execute cat command
+          POD_NAME=$(az aks command invoke \
             --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
             --name aks-wizapp-nonprod-eastus2-001 \
-            --command "kubectl get pods -n wizapp -l app=wizapp -o name | head -1 | xargs -I {} kubectl exec {} -- cat /app/wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+            --command "kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}'" \
+            --output tsv)
+          
+          if [ ! -z "$POD_NAME" ]; then
+            echo "**Pod Name:** $POD_NAME" >> $GITHUB_STEP_SUMMARY
+            az aks command invoke \
+              --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+              --name aks-wizapp-nonprod-eastus2-001 \
+              --command "kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Error:** No pods found with app=wizapp label" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Application Health Check
         run: |
@@ -357,8 +368,18 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Service IP:** $SERVICE_IP" >> $GITHUB_STEP_SUMMARY
           
-          kubectl run curl-test --image=curlimages/curl --rm -i --restart=Never -- \
-            curl -f http://wizapp-service.wizapp.svc.cluster.local/ || true
+          # Test internal connectivity using az aks command invoke
+          echo "**Internal Connectivity Test:**" >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl run curl-test --image=curlimages/curl --rm -i --restart=Never -- curl -f http://wizapp-service.wizapp.svc.cluster.local/ || echo 'Internal connectivity test failed'" >> $GITHUB_STEP_SUMMARY 2>&1 || true
+
+          # Test external connectivity if we have an external IP
+          if [ "$SERVICE_IP" != "" ] && [[ "$SERVICE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "**External Connectivity Test:**" >> $GITHUB_STEP_SUMMARY
+            curl -f "http://$SERVICE_IP/" --connect-timeout 10 --max-time 30 >> $GITHUB_STEP_SUMMARY 2>&1 || echo "External connectivity test failed" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Create deployment report
         if: always()
