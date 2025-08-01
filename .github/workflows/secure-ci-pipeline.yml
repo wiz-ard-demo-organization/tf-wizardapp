@@ -83,17 +83,20 @@ jobs:
           scan-ref: '.'
           scanners: 'secret'
           hide-progress: false
-          format: 'sarif'
-          output: 'trivy-secret-results.sarif'
+          format: 'json'
+          output: 'trivy-secret-results.json'
           exit-code: '0'
           severity: 'CRITICAL,HIGH'
 
-      - name: Upload secret scan results
+      - name: Display secret scan results
         if: always()
-        uses: github/codeql-action/upload-sarif@v2
-        with:
-          sarif_file: trivy-secret-results.sarif
-          category: trivy-secrets
+        run: |
+          if [ -f trivy-secret-results.json ]; then
+            echo "Secret Scan Results:"
+            cat trivy-secret-results.json | jq '.' || cat trivy-secret-results.json
+          else
+            echo  No secret scan results file found"
+          fi
 
       - name: Setup Docker buildx
         uses: docker/setup-buildx-action@v3
