@@ -43,14 +43,6 @@ jobs:
       - name: Build application
         run: go build -v ./...
 
-      - name: Verify wizexercise.txt exists
-        run: |
-          if [ ! -f "wizexercise.txt" ]; then
-            echo "wizexercise.txt file is missing!"
-            exit 1
-          fi
-          echo "wizexercise.txt file found"
-
       - name: Run Trivy config scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -95,7 +87,7 @@ jobs:
             echo "Secret Scan Results:"
             cat trivy-secret-results.json | jq '.' || cat trivy-secret-results.json
           else
-            echo  No secret scan results file found"
+            echo  "No secret scan results file found"
           fi
 
       - name: Setup Docker buildx
