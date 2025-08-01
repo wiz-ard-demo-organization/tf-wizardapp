@@ -1,0 +1,104 @@
+---
+# Namespace for the application
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wizapp
+  labels:
+    name: wizapp
+
+---
+# ServiceAccount for the application
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wizapp-sa
+  namespace: wizapp
+
+---
+# ClusterRoleBinding to assign cluster-wide admin role to the application
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wizapp-cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: wizapp-sa
+  namespace: wizapp
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Deployment for the Todo application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wizapp-deployment
+  namespace: wizapp
+  labels:
+    app: wizapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wizapp
+  template:
+    metadata:
+      labels:
+        app: wizapp
+    spec:
+      serviceAccountName: wizapp-sa
+      containers:
+      - name: wizapp
+        image: ${IMAGE_REFERENCE}
+        ports:
+        - containerPort: 8080
+        env:
+        - name: MONGODB_URI
+          valueFrom:
+            configMapKeyRef:
+              name: wizapp-config
+              key: MONGODB_URI
+        - name: GIN_MODE
+          value: "release"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# Service to expose the application
+apiVersion: v1
+kind: Service
+metadata:
+  name: wizapp-service
+  namespace: wizapp
+  labels:
+    app: wizapp
+spec:
+  selector:
+    app: wizapp
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+  type: LoadBalancer
+
+ 
