@@ -252,13 +252,6 @@ jobs:
           tenant-id: ${{ vars.ARM_TENANT_ID }}
           subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
 
-      - name: Get AKS Credentials
-        run: |
-          az aks get-credentials \
-            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
-            --name aks-wizapp-nonprod-eastus2-001 \
-            --overwrite-existing
-
       - name: Prepare Deployment Configuration
         run: |
           echo "Retrieving MongoDB credentials from Key Vault..."
@@ -269,21 +262,34 @@ jobs:
           export IMAGE_REFERENCE="${{ needs.validate_artifacts.outputs.full_reference }}"
           export MONGODB_URI="mongodb://$MONGODB_USER:$MONGODB_PASSWORD@10.100.0.4:27017/go-mongodb?authSource=admin"
           
-          # Create namespace first
-          kubectl create namespace wizapp --dry-run=client -o yaml | kubectl apply -f -
+          # Process template locally first
+          envsubst < k8s-manifests.yaml > processed-manifests.yaml
           
-          # Create ConfigMap with real credentials
-          kubectl create configmap wizapp-config \
-            --from-literal=MONGODB_URI="$MONGODB_URI" \
-            --namespace wizapp \
-            --dry-run=client -o yaml | kubectl apply -f -
+          # Create namespace using az aks command invoke
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl create namespace wizapp --dry-run=client -o yaml | kubectl apply -f -"
           
-          # Process template and apply manifests
-          envsubst < k8s-manifests.yaml | kubectl apply -f -
+          # Create ConfigMap using az aks command invoke
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl create configmap wizapp-config --from-literal=MONGODB_URI='$MONGODB_URI' --namespace wizapp --dry-run=client -o yaml | kubectl apply -f -"
+          
+          # Upload and apply manifests
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --file processed-manifests.yaml \
+            --command "kubectl apply -f processed-manifests.yaml"
 
       - name: Wait for Deployment
         run: |
-          kubectl wait --for=condition=available --timeout=300s deployment/wizapp-deployment -n wizapp
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl wait --for=condition=available --timeout=300s deployment/wizapp-deployment -n wizapp"
 
 
 
@@ -291,11 +297,18 @@ jobs:
         run: |
           echo "### Kubernetes Deployment Status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Pods:**" >> $GITHUB_STEP_SUMMARY
-          kubectl get pods -n wizapp >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Services:**" >> $GITHUB_STEP_SUMMARY
-          kubectl get svc -n wizapp >> $GITHUB_STEP_SUMMARY
+          
+          # Get service status
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get svc wizapp-service -n wizapp -o wide" >> $GITHUB_STEP_SUMMARY
+          
+          # Get LoadBalancer IP
+          az aks command invoke \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --name aks-wizapp-nonprod-eastus2-001 \
+            --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
 
       - name: Validate wizexercise.txt in Running Pod
         run: |
