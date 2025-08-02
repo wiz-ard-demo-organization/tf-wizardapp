@@ -137,7 +137,7 @@ jobs:
 
       - name: Log in to ACR
         run: |
-          REGISTRY=$(jq -r '.registry' image-metadata-*/image-metadata.json)
+          REGISTRY=${{ vars.REGISTRY_NAME }}
           echo "Image is in registry: $REGISTRY"
 
           REGISTRY_NAME=${REGISTRY%.azurecr.io}
