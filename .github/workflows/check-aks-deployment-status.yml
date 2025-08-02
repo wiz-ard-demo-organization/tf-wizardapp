@@ -2,23 +2,36 @@ name: Check AKS Deployment Status
 
 on:
   workflow_dispatch:  # Manual trigger
+    inputs:
+      environment:
+        description: 'Environment to check'
+        required: true
+        default: 'wizard'
+        type: choice
+        options:
+          - wizard
+  
   schedule:
     - cron: '*/30 * * * *'  # Run every 30 minutes (optional)
   
   # Also run after deployment completes
   workflow_run:
-    workflows: ["WizApp Secure CD - Deploy to AKS"]
+    workflows: ["Secure CD Pipeline - Validation & Deployment"]
     types:
       - completed
 
 env:
   RESOURCE_GROUP: rg-wizapp-compute-nonprod-eastus2-001
   AKS_CLUSTER_NAME: aks-wizapp-nonprod-eastus2-001
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
   
 jobs:
   check-deployment-status:
     name: Check AKS Deployment Status
     runs-on: ubuntu-latest
+    environment: wizard  # Default to wizard environment for scheduled/workflow_run triggers
     
     steps:
       - name: Checkout code
@@ -27,9 +40,9 @@ jobs:
       - name: Azure Login
         uses: azure/login@v1
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
           
       - name: Install PowerShell
         run: |
@@ -142,9 +155,9 @@ jobs:
         run: |
           echo "## 🔗 Important Links" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- [Azure Portal - AKS Cluster](https://portal.azure.com/#resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}/overview)" >> $GITHUB_STEP_SUMMARY
-          echo "- [Azure Portal - Workloads](https://portal.azure.com/#resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}/workloads)" >> $GITHUB_STEP_SUMMARY
-          echo "- [Storage Account](https://portal.azure.com/#resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-wizapp-storage-nonprod-eastus2-001/providers/Microsoft.Storage/storageAccounts/sawizbkpnonprod001/overview)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Azure Portal - AKS Cluster](https://portal.azure.com/#resource/subscriptions/${{ vars.ARM_SUBSCRIPTION_ID }}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}/overview)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Azure Portal - Workloads](https://portal.azure.com/#resource/subscriptions/${{ vars.ARM_SUBSCRIPTION_ID }}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}/workloads)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Storage Account](https://portal.azure.com/#resource/subscriptions/${{ vars.ARM_SUBSCRIPTION_ID }}/resourceGroups/rg-wizapp-storage-nonprod-eastus2-001/providers/Microsoft.Storage/storageAccounts/sawizbkpnonprod001/overview)" >> $GITHUB_STEP_SUMMARY
           
       - name: Create Issue on Failure
         if: failure()
