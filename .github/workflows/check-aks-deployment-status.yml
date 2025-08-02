@@ -1,0 +1,179 @@
+name: Check AKS Deployment Status
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '*/30 * * * *'  # Run every 30 minutes (optional)
+  
+  # Also run after deployment completes
+  workflow_run:
+    workflows: ["WizApp Secure CD - Deploy to AKS"]
+    types:
+      - completed
+
+env:
+  RESOURCE_GROUP: rg-wizapp-compute-nonprod-eastus2-001
+  AKS_CLUSTER_NAME: aks-wizapp-nonprod-eastus2-001
+  
+jobs:
+  check-deployment-status:
+    name: Check AKS Deployment Status
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          
+      - name: Install PowerShell
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y powershell
+          
+      - name: Run AKS Status Check
+        shell: pwsh
+        run: |
+          Write-Host "Running AKS deployment status check..." -ForegroundColor Green
+          ./check-aks-status.ps1
+          
+      - name: Get Application URL
+        id: get-app-url
+        run: |
+          # Try to get the LoadBalancer IP
+          LB_IP=$(az network public-ip list \
+            --resource-group MC_${RESOURCE_GROUP}_${AKS_CLUSTER_NAME}_eastus2 \
+            --query "[?tags.service=='wizapp/wizapp-service'].ipAddress" \
+            -o tsv 2>/dev/null || echo "")
+          
+          if [ -n "$LB_IP" ]; then
+            echo "app_url=http://$LB_IP" >> $GITHUB_OUTPUT
+            echo "## 🎯 Application URL" >> $GITHUB_STEP_SUMMARY
+            echo "Your application is accessible at: **http://$LB_IP**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "app_url=pending" >> $GITHUB_OUTPUT
+            echo "## ⏳ Application URL" >> $GITHUB_STEP_SUMMARY
+            echo "LoadBalancer IP is still being provisioned. Check back in a few minutes." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Create Status Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Output "## 📊 AKS Deployment Status Summary" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Output "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Output "**Cluster**: $env:AKS_CLUSTER_NAME" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Output "**Resource Group**: $env:RESOURCE_GROUP" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Output "**Timestamp**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Write-Output "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          
+          # Add quick status checks
+          Write-Output "### Quick Health Checks" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          
+          try {
+            # Check if deployment is ready
+            $deployReady = az aks command invoke `
+              --resource-group $env:RESOURCE_GROUP `
+              --name $env:AKS_CLUSTER_NAME `
+              --command "kubectl get deployment wizapp-deployment -n wizapp -o jsonpath='{.status.readyReplicas}'" `
+              --output tsv 2>$null
+              
+            $deployDesired = az aks command invoke `
+              --resource-group $env:RESOURCE_GROUP `
+              --name $env:AKS_CLUSTER_NAME `
+              --command "kubectl get deployment wizapp-deployment -n wizapp -o jsonpath='{.spec.replicas}'" `
+              --output tsv 2>$null
+              
+            if ($deployReady -eq $deployDesired -and $deployReady -gt 0) {
+              Write-Output "- ✅ Deployment: Ready ($deployReady/$deployDesired replicas)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            } else {
+              Write-Output "- ⚠️ Deployment: Not Ready ($deployReady/$deployDesired replicas)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+          } catch {
+            Write-Output "- ❌ Deployment: Unable to check status" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          
+          # Check service
+          try {
+            $svcExists = az aks command invoke `
+              --resource-group $env:RESOURCE_GROUP `
+              --name $env:AKS_CLUSTER_NAME `
+              --command "kubectl get svc wizapp-service -n wizapp --no-headers | wc -l" `
+              --output tsv 2>$null
+              
+            if ($svcExists -gt 0) {
+              Write-Output "- ✅ Service: Exists" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            } else {
+              Write-Output "- ❌ Service: Missing" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+          } catch {
+            Write-Output "- ❌ Service: Unable to check" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          
+      - name: Check MongoDB Connectivity
+        if: success()
+        continue-on-error: true
+        run: |
+          echo "### 🗄️ MongoDB Status" >> $GITHUB_STEP_SUMMARY
+          
+          # Get MongoDB VM IP
+          MONGODB_IP=$(az vm show -d -g ${RESOURCE_GROUP} -n vm-wizapp-mongodb-nonprod-eastus2-001 --query publicIps -o tsv 2>/dev/null || echo "")
+          
+          if [ -n "$MONGODB_IP" ]; then
+            echo "- MongoDB VM IP: **$MONGODB_IP**" >> $GITHUB_STEP_SUMMARY
+            
+            # Test SSH connectivity (without actually logging in)
+            if timeout 5 bash -c "echo >/dev/tcp/$MONGODB_IP/22" 2>/dev/null; then
+              echo "- SSH Port: ✅ Open" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- SSH Port: ❌ Closed or filtered" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "- ❌ Unable to retrieve MongoDB VM IP" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Display Important Links
+        if: always()
+        run: |
+          echo "## 🔗 Important Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [Azure Portal - AKS Cluster](https://portal.azure.com/#resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}/overview)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Azure Portal - Workloads](https://portal.azure.com/#resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}/workloads)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Storage Account](https://portal.azure.com/#resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-wizapp-storage-nonprod-eastus2-001/providers/Microsoft.Storage/storageAccounts/sawizbkpnonprod001/overview)" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Create Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'AKS Deployment Status Check Failed';
+            const body = `The AKS deployment status check failed at ${new Date().toISOString()}.
+            
+            **Workflow Run**: [${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            
+            Please check the logs for more details.`;
+            
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['deployment-status', 'automated']
+            });
+            
+            const existingIssue = issues.data.find(issue => issue.title === title);
+            
+            if (!existingIssue) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['deployment-status', 'automated']
+              });
+            }

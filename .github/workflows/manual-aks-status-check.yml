@@ -1,0 +1,131 @@
+name: Manual AKS Status Check
+
+on:
+  workflow_dispatch:  # Manual trigger only
+    inputs:
+      detailed_logs:
+        description: 'Show detailed pod logs'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  RESOURCE_GROUP: rg-wizapp-compute-nonprod-eastus2-001
+  AKS_CLUSTER_NAME: aks-wizapp-nonprod-eastus2-001
+  
+jobs:
+  status-check:
+    name: Check AKS Status
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          
+      - name: Quick Status Check
+        id: quick-check
+        run: |
+          echo "## 🔍 AKS Deployment Quick Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get pods
+          echo "### Pods in wizapp namespace:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl get pods -n wizapp -o wide" \
+            --output table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get pods" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Get service and LoadBalancer IP
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Service Status:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl get svc wizapp-service -n wizapp" \
+            --output table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get service" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Try to get LoadBalancer IP directly
+          LB_IP=$(az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}'" \
+            --output tsv 2>/dev/null || echo "")
+            
+          if [ -n "$LB_IP" ] && [ "$LB_IP" != "null" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🎯 Application URL" >> $GITHUB_STEP_SUMMARY
+            echo "**Your application is accessible at: http://$LB_IP**" >> $GITHUB_STEP_SUMMARY
+            echo "app_url=http://$LB_IP" >> $GITHUB_OUTPUT
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⏳ LoadBalancer Status" >> $GITHUB_STEP_SUMMARY
+            echo "LoadBalancer IP is still being provisioned. This can take 2-5 minutes." >> $GITHUB_STEP_SUMMARY
+            echo "app_url=pending" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Detailed Logs
+        if: ${{ github.event.inputs.detailed_logs == 'true' }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Detailed Pod Logs" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl logs -n wizapp -l app=wizapp --tail=50" \
+            --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "No logs available" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+      - name: Verify wizexercise.txt
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📄 Wiz Exercise File Validation" >> $GITHUB_STEP_SUMMARY
+          
+          POD_NAME=$(az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}'" \
+            --output tsv 2>/dev/null || echo "")
+            
+          if [ -n "$POD_NAME" ] && [ "$POD_NAME" != "null" ]; then
+            echo "Checking wizexercise.txt in pod: $POD_NAME" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            az aks command invoke \
+              --resource-group $RESOURCE_GROUP \
+              --name $AKS_CLUSTER_NAME \
+              --command "kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt" \
+              --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to read wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ No running pods found to check wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Additional Resources
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Useful Commands" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To run these checks locally:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Get application URL" >> $GITHUB_STEP_SUMMARY
+          echo "az network public-ip list --resource-group MC_${RESOURCE_GROUP}_${AKS_CLUSTER_NAME}_eastus2 --query \"[?tags.service=='wizapp/wizapp-service'].ipAddress\" -o tsv" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Check pods via Azure CLI" >> $GITHUB_STEP_SUMMARY
+          echo "az aks command invoke --resource-group $RESOURCE_GROUP --name $AKS_CLUSTER_NAME --command \"kubectl get pods -n wizapp\"" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

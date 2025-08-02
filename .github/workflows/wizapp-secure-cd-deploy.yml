@@ -79,7 +79,7 @@ jobs:
           BRANCH=$(cat branch-name.txt)
 
           IMAGE_NAME=$(jq -r '.image_name' image-metadata.json)
-          REGISTRY=$(jq -r '.registry' image-metadata.json)
+          REGISTRY=${{ vars.REGISTRY_NAME }}
 
           echo "digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
