@@ -79,7 +79,7 @@ jobs:
           BRANCH=$(cat branch-name.txt)
 
           IMAGE_NAME=$(jq -r '.image_name' image-metadata.json)
-          REGISTRY=${{ vars.REGISTRY_NAME }}
+          REGISTRY= "acrwizappnonprod002"
 
           echo "digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
@@ -140,7 +140,7 @@ jobs:
           REGISTRY=${{ vars.REGISTRY_NAME }}
           echo "Image is in registry: $REGISTRY"
 
-          REGISTRY_NAME=${REGISTRY%.azurecr.io}
+          REGISTRY_NAME="acrwizappnonprod002"
           echo "Logging into ACR: $REGISTRY_NAME"
 
           az acr login --name $REGISTRY_NAME
