@@ -12,6 +12,10 @@ on:
           - 'true'
           - 'false'
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
   RESOURCE_GROUP: rg-wizapp-compute-nonprod-eastus2-001
   AKS_CLUSTER_NAME: aks-wizapp-nonprod-eastus2-001
