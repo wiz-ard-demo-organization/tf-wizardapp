@@ -11,13 +11,6 @@ on:
         options:
           - 'true'
           - 'false'
-      environment:
-        description: 'Environment to check'
-        required: true
-        default: 'wizard'
-        type: choice
-        options:
-          - wizard
 
 env:
   RESOURCE_GROUP: rg-wizapp-compute-nonprod-eastus2-001
@@ -30,13 +23,13 @@ jobs:
   status-check:
     name: Check AKS Status
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment: wizard
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         
-      - name: Azure Login
+      - name: Azure Login via OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ vars.ARM_CLIENT_ID }}
