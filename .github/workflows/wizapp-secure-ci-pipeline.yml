@@ -10,7 +10,7 @@ permissions:
   security-events: write
 
 env:
-  REGISTRY_NAME: acrwizappnonprod001
+  REGISTRY_NAME: acrwizappnonprod002
   IMAGE_NAME: wizapp
   ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
   ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: wizard
     env:
-      REMOTE_IMAGE_NAME: acrwizappnonprod001.azurecr.io/nonprod/wizapp:${{ github.sha }}
+      REMOTE_IMAGE_NAME: acrwizappnonprod002.azurecr.io/nonprod/wizapp:${{ github.sha }}
     outputs:
       image_digest: ${{ steps.get_digest.outputs.digest }}
       scan_passed: ${{ steps.scan_analysis.outputs.scan_passed }}
