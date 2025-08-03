@@ -260,7 +260,7 @@ jobs:
           
           # Use hardcoded MongoDB public IP (safer than dynamic lookup)
           # TODO: Update this IP after terraform apply - get from: terraform output mongodb_public_ip
-          MONGODB_IP="135.119.171.52"  # MongoDB VM public IP
+          MONGODB_IP="10.100.0.4"  # MongoDB VM private IP
           echo "Using MongoDB IP: $MONGODB_IP"
           
           # URL encode the password to handle special characters
