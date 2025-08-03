@@ -11,6 +11,14 @@ on:
         options:
           - 'true'
           - 'false'
+      validate_security:
+        description: 'Run security validations'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
   id-token: write
@@ -40,10 +48,36 @@ jobs:
           tenant-id: ${{ vars.ARM_TENANT_ID }}
           subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
           
-      - name: Quick Status Check
+      - name: Infrastructure Status
+        id: infrastructure
+        run: |
+          echo "## 🏗️ Infrastructure Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get VM status
+          echo "### MongoDB VM Status:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az vm show --name vm-wizapp-mongodb-nonprod-eastus2-001 \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --query "{Name:name, PowerState:powerState, PublicIP:publicIps}" \
+            -o table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get VM status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Get AKS cluster status
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### AKS Cluster Status:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks show --name $AKS_CLUSTER_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --query "{Name:name, Status:powerState.code, Version:kubernetesVersion, PrivateCluster:apiServerAccessProfile.enablePrivateCluster}" \
+            -o table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get AKS status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+      - name: Application Status Check
         id: quick-check
         run: |
-          echo "## 🔍 AKS Deployment Quick Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔍 Application Status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Get pods
@@ -67,30 +101,123 @@ jobs:
             --output table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get service" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           
-          # Try to get LoadBalancer IP directly
-          LB_IP=$(az aks command invoke \
-            --resource-group $RESOURCE_GROUP \
-            --name $AKS_CLUSTER_NAME \
-            --command "kubectl get svc wizapp-service -n wizapp -o jsonpath='{.status.loadBalancer.ingress[0].ip}'" \
-            --output tsv 2>/dev/null || echo "")
-            
+          # Get LoadBalancer IP using the correct method from validation guide
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Load Balancer IP:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          LB_IP=$(az network public-ip list \
+            --resource-group MC_${RESOURCE_GROUP}_${AKS_CLUSTER_NAME}_eastus2 \
+            --query "[?tags.Workload=='wizapp'].ipAddress" \
+            -o tsv 2>/dev/null || echo "")
+          
           if [ -n "$LB_IP" ] && [ "$LB_IP" != "null" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 🎯 Application URL" >> $GITHUB_STEP_SUMMARY
-            echo "**Your application is accessible at: http://$LB_IP**" >> $GITHUB_STEP_SUMMARY
+            echo "Load Balancer IP: $LB_IP" >> $GITHUB_STEP_SUMMARY
             echo "app_url=http://$LB_IP" >> $GITHUB_OUTPUT
-          else
+            
+            # Test application accessibility
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### ⏳ LoadBalancer Status" >> $GITHUB_STEP_SUMMARY
-            echo "LoadBalancer IP is still being provisioned. This can take 2-5 minutes." >> $GITHUB_STEP_SUMMARY
+            echo "### 🌐 Application Accessibility Test:" >> $GITHUB_STEP_SUMMARY
+            if curl -s --max-time 10 http://$LB_IP/ > /dev/null; then
+              echo "✅ Application is accessible at http://$LB_IP" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Application is not responding at http://$LB_IP" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "❌ LoadBalancer IP not found or still provisioning" >> $GITHUB_STEP_SUMMARY
             echo "app_url=pending" >> $GITHUB_OUTPUT
           fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+      - name: Kubernetes Environment Validation
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ⚙️ Kubernetes Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check ConfigMap
+          echo "### MONGODB_URI ConfigMap:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl describe configmap wizapp-config -n wizapp" \
+            --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get ConfigMap" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Check environment variables in deployment
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment Variables in Deployment:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl describe deployment wizapp-deployment -n wizapp | grep -A 5 -B 5 MONGODB_URI" \
+            --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get deployment environment variables" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+      - name: Security Validation
+        if: ${{ github.event.inputs.validate_security == 'true' }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔒 Security Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check cluster-admin role binding
+          echo "### Cluster Admin Role Binding:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl get clusterrolebinding wizapp-cluster-admin -o yaml" \
+            --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get cluster role binding" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Test admin privileges
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Admin Privilege Test (List Secrets):" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --command "kubectl get secrets --all-namespaces | head -10" \
+            --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to list secrets" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Check VM permissions
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### VM IAM Roles (Security Risk):" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          VM_PRINCIPAL_ID=$(az vm show --name vm-wizapp-mongodb-nonprod-eastus2-001 \
+            --resource-group rg-wizapp-compute-nonprod-eastus2-001 \
+            --query identity.principalId -o tsv 2>/dev/null || echo "")
+          
+          if [ -n "$VM_PRINCIPAL_ID" ]; then
+            az role assignment list --assignee $VM_PRINCIPAL_ID \
+              --query "[].{Role:roleDefinitionName, Scope:scope}" \
+              -o table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get VM role assignments" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Failed to get VM principal ID" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+      - name: Storage Security Check
+        if: ${{ github.event.inputs.validate_security == 'true' }}
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Storage Account Security (Public Access Risk):" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az storage account show \
+            --name sawizbkpnonprod002 \
+            --resource-group rg-wizapp-storage-nonprod-eastus2-001 \
+            --query "{Name:name, PublicAccess:allowBlobPublicAccess, AllowNestedItems:allowNestedItemsToBePublic}" \
+            -o table >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get storage account info" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
           
       - name: Detailed Logs
         if: ${{ github.event.inputs.detailed_logs == 'true' }}
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📋 Detailed Pod Logs" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Detailed Pod Logs" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           az aks command invoke \
             --resource-group $RESOURCE_GROUP \
@@ -102,38 +229,44 @@ jobs:
       - name: Verify wizexercise.txt
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📄 Wiz Exercise File Validation" >> $GITHUB_STEP_SUMMARY
+          echo "## 📄 Wiz Exercise File Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          POD_NAME=$(az aks command invoke \
+          echo "### wizexercise.txt Content:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          az aks command invoke \
             --resource-group $RESOURCE_GROUP \
             --name $AKS_CLUSTER_NAME \
-            --command "kubectl get pods -n wizapp -l app=wizapp -o jsonpath='{.items[0].metadata.name}'" \
-            --output tsv 2>/dev/null || echo "")
-            
-          if [ -n "$POD_NAME" ] && [ "$POD_NAME" != "null" ]; then
-            echo "Checking wizexercise.txt in pod: $POD_NAME" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            az aks command invoke \
-              --resource-group $RESOURCE_GROUP \
-              --name $AKS_CLUSTER_NAME \
-              --command "kubectl exec -n wizapp $POD_NAME -- cat /app/wizexercise.txt" \
-              --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to read wizexercise.txt" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ No running pods found to check wizexercise.txt" >> $GITHUB_STEP_SUMMARY
-          fi
+            --command "kubectl exec -n wizapp deployment/wizapp-deployment -- cat /app/wizexercise.txt" \
+            --output tsv >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to read wizexercise.txt" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
           
-      - name: Additional Resources
+      - name: Summary and Next Steps
         if: always()
         run: |
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔗 Useful Commands" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Summary & Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "To run these checks locally:" >> $GITHUB_STEP_SUMMARY
+          echo "### For Manual Validation:" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
           echo "# Get application URL" >> $GITHUB_STEP_SUMMARY
-          echo "az network public-ip list --resource-group MC_${RESOURCE_GROUP}_${AKS_CLUSTER_NAME}_eastus2 --query \"[?tags.service=='wizapp/wizapp-service'].ipAddress\" -o tsv" >> $GITHUB_STEP_SUMMARY
+          echo "az network public-ip list --resource-group MC_${RESOURCE_GROUP}_${AKS_CLUSTER_NAME}_eastus2 --query \"[?tags.Workload=='wizapp'].ipAddress\" -o tsv" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "# Check pods via Azure CLI" >> $GITHUB_STEP_SUMMARY
-          echo "az aks command invoke --resource-group $RESOURCE_GROUP --name $AKS_CLUSTER_NAME --command \"kubectl get pods -n wizapp\"" >> $GITHUB_STEP_SUMMARY
+          echo "# Test application" >> $GITHUB_STEP_SUMMARY
+          echo "curl http://130.213.185.231/" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Check container file" >> $GITHUB_STEP_SUMMARY
+          echo "az aks command invoke --resource-group $RESOURCE_GROUP --name $AKS_CLUSTER_NAME --command \"kubectl exec -n wizapp deployment/wizapp-deployment -- cat /app/wizexercise.txt\"" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# SSH to MongoDB VM (password: WizExercise123!)" >> $GITHUB_STEP_SUMMARY
+          echo "MONGODB_IP=\$(az vm show -d -g rg-wizapp-compute-nonprod-eastus2-001 -n vm-wizapp-mongodb-nonprod-eastus2-001 --query publicIps -o tsv)" >> $GITHUB_STEP_SUMMARY
+          echo "ssh azureuser@\$MONGODB_IP" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Security Issues to Demonstrate:" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **VM has overly permissive IAM roles** (Contributor, User Access Administrator)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **Container has cluster-admin privileges** (can access all secrets)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **Storage account allows public access** (MongoDB backups publicly accessible)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **SSH exposed to internet** (0.0.0.0/0 on port 22)" >> $GITHUB_STEP_SUMMARY
+          echo "- ⚠️ **Outdated software** (Ubuntu 18.04, MongoDB 4.0)" >> $GITHUB_STEP_SUMMARY
